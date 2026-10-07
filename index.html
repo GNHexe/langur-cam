@@ -94,7 +94,8 @@ let mediaStream = null, micSrc = null, pitchFx = null, recDest = null, analyser 
 let monitorOn = false, greenOn = false, debugOn = false, handsOn = true, running = false;
 let pose = null, lastSeen = 0, langurAlpha = 1;
 let mouth = 'closed', blinkOn = false, blinkBase = null, lipActiveUntil = 0;
-let noiseDb = -60, level = 0;
+let noiseDb = -60, level = 0, prevOpen = 0, motion = 0;
+let blinkHist = [], blinkStart = 0, blinkLock = false;
 let hands = [], lastHandAt = 0;
 let recorder = null, chunks = [], recStart = 0, lastBlob = null, lastMime = '';
 let rafId = 0, lastDbg = null;
@@ -104,6 +105,7 @@ const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; 
 const [maskCv, maskCtx] = mk(1, 1);
 const [personCv, personCtx] = mk(CW, CH);
 const [handCv, handCtx] = mk(CW, CH);
+const [handMaskCv, handMaskCtx] = mk(CW, CH);
 let maskImg = null;
 
 // ---------- ui ----------
@@ -276,26 +278,30 @@ const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,
 const PALM = [0, 1, 5, 9, 13, 17];
 function drawHands(r, vw) {
   if (!hands.length) return;
-  handCtx.globalCompositeOperation = 'source-over';
-  handCtx.clearRect(0, 0, CW, CH);
-  handCtx.fillStyle = handCtx.strokeStyle = '#fff';
-  handCtx.lineCap = handCtx.lineJoin = 'round';
+  const m = handMaskCtx;
+  m.clearRect(0, 0, CW, CH);
+  m.fillStyle = m.strokeStyle = '#fff';
+  m.lineCap = m.lineJoin = 'round';
   for (const h of hands) {
     const palmW = dist(h[5], h[17]);
-    handCtx.lineWidth = palmW * 0.42;
-    handCtx.beginPath();
-    PALM.forEach((i, n) => n ? handCtx.lineTo(h[i].x, h[i].y) : handCtx.moveTo(h[i].x, h[i].y));
-    handCtx.closePath(); handCtx.fill(); handCtx.stroke();
-    handCtx.beginPath();
-    for (const [a, b] of BONES) { handCtx.moveTo(h[a].x, h[a].y); handCtx.lineTo(h[b].x, h[b].y); }
-    handCtx.stroke();
-    // wrist / forearm stub so the hand doesn't float
-    const w = h[0], m = h[9], dx = w.x - m.x, dy = w.y - m.y;
-    handCtx.lineWidth = palmW * 0.9;
-    handCtx.beginPath(); handCtx.moveTo(w.x, w.y); handCtx.lineTo(w.x + dx * 0.6, w.y + dy * 0.6); handCtx.stroke();
+    m.lineWidth = palmW * 0.32;
+    m.beginPath();
+    PALM.forEach((i, n) => n ? m.lineTo(h[i].x, h[i].y) : m.moveTo(h[i].x, h[i].y));
+    m.closePath(); m.fill(); m.stroke();
+    m.beginPath();
+    for (const [a, b] of BONES) { m.moveTo(h[a].x, h[a].y); m.lineTo(h[b].x, h[b].y); }
+    m.stroke();
+    const w = h[0], c = h[9], dx = w.x - c.x, dy = w.y - c.y;
+    m.lineWidth = palmW * 0.8;
+    m.beginPath(); m.moveTo(w.x, w.y); m.lineTo(w.x + dx * 0.6, w.y + dy * 0.6); m.stroke();
   }
-  handCtx.globalCompositeOperation = 'source-in';
+  // camera first, then keep only the hand shapes. Safari ignores composite modes when the source is a video,
+  // so the video is always drawn plain and the masking is done with a canvas.
+  handCtx.globalCompositeOperation = 'source-over';
+  handCtx.clearRect(0, 0, CW, CH);
   drawMirrored(handCtx, cam, r);
+  handCtx.globalCompositeOperation = 'destination-in';
+  handCtx.drawImage(handMaskCv, 0, 0);
   handCtx.globalCompositeOperation = 'source-over';
   if (greenOn && maskImg) applyPersonMask(handCtx, r, vw);
   ctx.drawImage(handCv, 0, 0);
@@ -353,14 +359,18 @@ function loop(now) {
     if (!pose) pose = target;
     else for (const k in target) pose[k] = lerp(pose[k], target[k], k === 'brow' ? 0.35 : 0.55);
 
-    // mouth: lip gap and jaw drive it; voice only counts while your own lips are moving,
+    // mouth: lip gap + mouth blendshapes; voice only counts while your mouth is actually moving,
     // so other people talking or music doesn't flap the langur
     const sens = +sensEl.value;
-    const lipScore = clamp01((lip - 0.012) / 0.07);
-    const jawScore = clamp01(jaw / 0.35);
-    if (lipScore > 0.06 || jawScore > 0.12) lipActiveUntil = now + 350;
-    const voiceUsed = now < lipActiveUntil ? voice * 0.8 : 0;
-    const raw = Math.max(lipScore, jawScore, voiceUsed) * sens;
+    const lower = (bs(cats, 'mouthLowerDownLeft') + bs(cats, 'mouthLowerDownRight')) / 2;
+    const upper = (bs(cats, 'mouthUpperUpLeft') + bs(cats, 'mouthUpperUpRight')) / 2;
+    const lipScore = clamp01((lip - 0.006) / 0.05);
+    const shapeScore = clamp01(Math.max(jaw / 0.3, lower / 0.35, upper / 0.45));
+    const open = Math.max(lipScore, shapeScore);
+    motion = lerp(motion, Math.abs(open - prevOpen), 0.3); prevOpen = open;
+    if (open > 0.08 || motion > 0.015) lipActiveUntil = now + 600;
+    const voiceUsed = now < lipActiveUntil ? voice * 0.85 : 0;
+    const raw = Math.max(open, voiceUsed) * sens;
     level = raw > level ? lerp(level, raw, 0.7) : lerp(level, raw, 0.45);
     const smiling = smile > (mouth === 'grin' ? 0.28 : 0.38);
     if (level > (mouth === 'wide' ? 0.5 : 0.62)) mouth = 'wide';
@@ -368,15 +378,23 @@ function loop(now) {
     else if (level > (mouth === 'small' ? 0.1 : 0.16)) mouth = 'small';
     else mouth = 'closed';
 
-    // blink relative to this person's resting eye score; trigger point scales with how much room is left
+    // blink: a real blink is a fast spike above your resting level that's over in well under half a second.
+    // Slow rises (looking down at the phone, squinting) are ignored.
     if (blinkBase === null) blinkBase = blink;
-    if (!blinkOn && blink < blinkBase + 0.08) blinkBase = lerp(blinkBase, blink, 0.04);
-    else if (!blinkOn && blink < blinkBase) blinkBase = blink;
-    const span = Math.max(0.15, 1 - blinkBase);
-    blinkOn = blinkOn ? blink > blinkBase + span * 0.22 : blink > blinkBase + span * 0.33;
+    if (!blinkOn) blinkBase = lerp(blinkBase, blink, blink < blinkBase + 0.08 ? 0.04 : 0.004);
+    blinkHist.push([now, blink]); while (blinkHist.length && now - blinkHist[0][0] > 220) blinkHist.shift();
+    const recentMin = Math.min(...blinkHist.map(b => b[1]));
+    const span = Math.max(0.2, 1 - blinkBase);
+    if (blinkOn) {
+      if (blink < blinkBase + span * 0.25 || now - blinkStart > 380) { blinkOn = false; blinkLock = now - blinkStart > 380; }
+    } else if (blinkLock) {
+      if (blink < blinkBase + span * 0.2) blinkLock = false;      // wait until eyes reopen before allowing another
+    } else if (blink > blinkBase + span * 0.4 && blink - recentMin > span * 0.3) {
+      blinkOn = true; blinkStart = now;
+    }
 
     lastSeen = now;
-    lastDbg = { lip: lipScore, jaw: jawScore, voice: voiceUsed, mouthLvl: clamp01(level), smile, blink, eyeBase: blinkBase, yaw: Math.abs(yaw) };
+    lastDbg = { lip: lipScore, shape: shapeScore, motion: clamp01(motion * 10), voice: voiceUsed, mouthLvl: clamp01(level), smile, blink, eyeBase: blinkBase, yaw: Math.abs(yaw) };
   }
 
   // duck-out: face gone AND a hand is up near where the face was = you're holding something in front of it
